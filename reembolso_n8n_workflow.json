@@ -1,0 +1,642 @@
+{
+  "name": "Automação de Reembolsos",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "reembolso/upload",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "node-webhook",
+      "name": "01 - Webhook Upload",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 100],
+      "webhookId": "reembolso-upload"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            { "id": "a1", "name": "user_id",   "value": "={{ $json.body.user_id }}",  "type": "string" },
+            { "id": "a2", "name": "plano_id",  "value": "={{ $json.body.plano_id }}", "type": "string" },
+            { "id": "a3", "name": "file_b64",  "value": "={{ $json.body.file }}",     "type": "string" },
+            { "id": "a4", "name": "file_type", "value": "={{ $json.body.file_type }}", "type": "string" },
+            { "id": "a5", "name": "file_size", "value": "={{ $json.body.file_size }}", "type": "number" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-set-normalize",
+      "name": "02 - Set: Normalizar Payload",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [460, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "const { randomUUID } = require('crypto');\n\nconst item = $input.first().json;\n\nreturn [{\n  json: {\n    ...item,\n    request_id: randomUUID(),\n    received_at: new Date().toISOString(),\n    status: 'RECEIVED',\n    retry_count: 0\n  }\n}];"
+      },
+      "id": "node-fn-requestid",
+      "name": "03 - Function: Gerar request_id",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [680, 100]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.file_type }}",
+              "rightValue": "application/pdf",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.file_size }}",
+              "rightValue": 10485760,
+              "operator": { "type": "number", "operation": "lt" }
+            },
+            {
+              "id": "c3",
+              "leftValue": "={{ $json.file_b64 }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-validate-file",
+      "name": "04 - IF: Arquivo Válido?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [900, 100]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://{{ $env.S3_BUCKET }}.s3.{{ $env.AWS_REGION }}.amazonaws.com/reembolsos/{{ $json.request_id }}/documento",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "={{ $json.file_type }}" },
+            { "name": "x-amz-meta-request-id", "value": "={{ $json.request_id }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "options": {}
+      },
+      "id": "node-http-s3",
+      "name": "05 - HTTP: Upload S3",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 0],
+      "credentials": {
+        "httpHeaderAuth": { "id": "CONFIGURE_AWS_CRED", "name": "AWS Header Auth" }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO reembolso_requests (request_id, user_id, plano_id, file_url, status, received_at, retry_count)\nVALUES (\n  '{{ $json.request_id }}',\n  '{{ $json.user_id }}',\n  '{{ $json.plano_id }}',\n  'https://{{ $env.S3_BUCKET }}.s3.{{ $env.AWS_REGION }}.amazonaws.com/reembolsos/{{ $json.request_id }}/documento',\n  'RECEIVED',\n  '{{ $json.received_at }}',\n  0\n) RETURNING *;",
+        "options": {}
+      },
+      "id": "node-pg-save",
+      "name": "06 - Postgres: Salvar Request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 200],
+      "credentials": {
+        "postgres": { "id": "CONFIGURE_PG_CRED", "name": "Postgres Supabase" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://vision.googleapis.com/v1/images:annotate",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"requests\": [{\n    \"image\": { \"content\": \"{{ $json.file_b64 }}\" },\n    \"features\": [\n      { \"type\": \"DOCUMENT_TEXT_DETECTION\", \"maxResults\": 1 }\n    ]\n  }]\n}",
+        "options": {}
+      },
+      "id": "node-http-ocr-primary",
+      "name": "07 - HTTP: OCR Google Vision",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 100],
+      "credentials": {
+        "httpHeaderAuth": { "id": "CONFIGURE_GCLOUD_CRED", "name": "Google Cloud API Key" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\n\n// Extrai texto do response Google Vision\nconst fullText = item.responses?.[0]?.fullTextAnnotation?.text ?? '';\nconst confidence = item.responses?.[0]?.fullTextAnnotation?.pages?.[0]?.confidence ?? 0;\n\nreturn [{\n  json: {\n    ...item,\n    ocr_text: fullText,\n    ocr_confidence: confidence,\n    ocr_provider: 'google_vision'\n  }\n}];"
+      },
+      "id": "node-fn-ocr-extract",
+      "name": "08 - Function: Extrair Texto OCR",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 100]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.ocr_confidence }}",
+              "rightValue": 0.7,
+              "operator": { "type": "number", "operation": "gte" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-ocr-confidence",
+      "name": "09 - IF: OCR Confiança OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1780, 100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://{{ $env.AWS_REGION }}.textract.amazonaws.com/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/x-amz-json-1.1" },
+            { "name": "X-Amz-Target", "value": "Textract.DetectDocumentText" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"Document\": {\n    \"Bytes\": \"{{ $json.file_b64 }}\"\n  }\n}",
+        "options": {}
+      },
+      "id": "node-http-ocr-fallback",
+      "name": "10 - HTTP: OCR Fallback (Textract)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 200],
+      "credentials": {
+        "httpHeaderAuth": { "id": "CONFIGURE_AWS_CRED", "name": "AWS Header Auth" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key",         "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version",  "value": "2023-06-01" },
+            { "name": "Content-Type",       "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 1024,\n  \"system\": \"Você é um extrator de dados de documentos médicos brasileiros. Retorne APENAS um JSON válido, sem markdown, sem explicações. Campos obrigatórios: valor (number), data (string YYYY-MM-DD), procedimento (string), prestador (string), crm_prestador (string ou null), tuss_codigo (string ou null), beneficiario (string).\",\n  \"messages\": [{\n    \"role\": \"user\",\n    \"content\": \"Extraia os dados deste documento médico:\\n\\n{{ $json.ocr_text }}\"\n  }]\n}",
+        "options": {}
+      },
+      "id": "node-http-llm-parse",
+      "name": "11 - HTTP: LLM Parsing (Claude)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2220, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\n\n// Parse o JSON retornado pelo LLM\nlet parsed;\ntry {\n  const rawText = item.content[0].text.replace(/```json|```/g, '').trim();\n  parsed = JSON.parse(rawText);\n} catch (e) {\n  throw new Error('LLM_PARSE_ERROR: ' + e.message);\n}\n\n// Validação de schema\nconst required = ['valor', 'data', 'procedimento', 'prestador', 'beneficiario'];\nconst missing = required.filter(f => parsed[f] === undefined || parsed[f] === null || parsed[f] === '');\n\nif (missing.length > 0) {\n  throw new Error('SCHEMA_INVALID: campos faltando: ' + missing.join(', '));\n}\n\nif (typeof parsed.valor !== 'number' || parsed.valor <= 0) {\n  throw new Error('SCHEMA_INVALID: valor deve ser número positivo');\n}\n\nif (!/^\\d{4}-\\d{2}-\\d{2}$/.test(parsed.data)) {\n  throw new Error('SCHEMA_INVALID: data deve ser YYYY-MM-DD');\n}\n\nreturn [{\n  json: {\n    ...item,\n    parsed_data: parsed,\n    schema_valid: true\n  }\n}];"
+      },
+      "id": "node-fn-schema-validate",
+      "name": "12 - Function: Validar Schema",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2440, 100]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT \n  p.id as plano_id,\n  p.nome as plano_nome,\n  pc.procedimento_codigo,\n  pc.procedimento_nome,\n  pc.cobertura_percentual,\n  pc.valor_maximo,\n  pc.carencia_dias,\n  pc.coparticipacao_percentual,\n  pc.versao as regra_versao\nFROM planos p\nJOIN plano_coberturas pc ON pc.plano_id = p.id\nWHERE p.id = '{{ $json.plano_id }}'\n  AND (\n    pc.procedimento_codigo = '{{ $json.parsed_data.tuss_codigo }}'\n    OR pc.procedimento_nome ILIKE '%{{ $json.parsed_data.procedimento }}%'\n  )\n  AND p.ativo = true\nLIMIT 1;",
+        "options": {}
+      },
+      "id": "node-pg-regras",
+      "name": "13 - Postgres: Buscar Regras do Plano",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2660, 100],
+      "credentials": {
+        "postgres": { "id": "CONFIGURE_PG_CRED", "name": "Postgres Supabase" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst parsed = item.parsed_data;\nconst regra = item[0] ?? {}; // resultado do Postgres\n\nconst issues = [];\n\n// 1. Procedimento coberto?\nif (!regra.plano_id) {\n  issues.push('PROCEDIMENTO_NAO_COBERTO');\n}\n\n// 2. Carência\nif (regra.carencia_dias > 0) {\n  const dataDoc = new Date(parsed.data);\n  const dataAdesao = new Date(item.data_adesao ?? '2000-01-01');\n  const diffDias = (dataDoc - dataAdesao) / (1000 * 60 * 60 * 24);\n  if (diffDias < regra.carencia_dias) {\n    issues.push('EM_CARENCIA');\n  }\n}\n\n// 3. Teto de valor\nconst valorBruto = parsed.valor;\nconst valorLimite = regra.valor_maximo ?? Infinity;\nconst valorBase = Math.min(valorBruto, valorLimite);\n\n// 4. Cálculo\nconst cobertura = (regra.cobertura_percentual ?? 0) / 100;\nconst copart = (regra.coparticipacao_percentual ?? 0) / 100;\nconst valorReembolso = valorBase * cobertura * (1 - copart);\n\nreturn [{\n  json: {\n    ...item,\n    regra_aplicada: regra,\n    regra_versao: regra.regra_versao ?? 'v1',\n    issues_regras: issues,\n    valor_bruto: valorBruto,\n    valor_base: parseFloat(valorBase.toFixed(2)),\n    valor_reembolso: parseFloat(valorReembolso.toFixed(2)),\n    regras_ok: issues.length === 0\n  }\n}];"
+      },
+      "id": "node-fn-regras",
+      "name": "14 - Function: Aplicar Regras ANS",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2880, 100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key",         "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version",  "value": "2023-06-01" },
+            { "name": "Content-Type",       "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"model\": \"claude-sonnet-4-20250514\",\n  \"max_tokens\": 512,\n  \"system\": \"Você é um detector de fraudes em reembolsos de planos de saúde. Analise os dados e retorne APENAS um JSON com: fraud_score (0.0 a 1.0), flags (array de strings), recomendacao (AUTO_APPROVE | MANUAL_REVIEW | REJECT).\",\n  \"messages\": [{\n    \"role\": \"user\",\n    \"content\": \"Analise este pedido de reembolso:\\nValor solicitado: {{ $json.valor_bruto }}\\nValor calculado: {{ $json.valor_reembolso }}\\nProcedimento: {{ $json.parsed_data.procedimento }}\\nPrestador: {{ $json.parsed_data.prestador }}\\nCRM: {{ $json.parsed_data.crm_prestador }}\\nData: {{ $json.parsed_data.data }}\\nBeneficiário: {{ $json.parsed_data.beneficiario }}\\nProblemas de regra: {{ $json.issues_regras }}\"\n  }]\n}",
+        "options": {}
+      },
+      "id": "node-http-fraud",
+      "name": "15 - HTTP: Detecção de Fraude (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3100, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\n\nlet fraudAnalysis;\ntry {\n  const rawText = item.content[0].text.replace(/```json|```/g, '').trim();\n  fraudAnalysis = JSON.parse(rawText);\n} catch (e) {\n  // Fallback seguro em caso de erro do LLM\n  fraudAnalysis = { fraud_score: 0.5, flags: ['LLM_PARSE_ERROR'], recomendacao: 'MANUAL_REVIEW' };\n}\n\n// Regras hard-coded adicionais\nif (item.valor_bruto > 5000) {\n  fraudAnalysis.flags.push('VALOR_ALTO');\n  fraudAnalysis.fraud_score = Math.min(fraudAnalysis.fraud_score + 0.2, 1.0);\n}\n\nreturn [{\n  json: {\n    ...item,\n    fraud_score: fraudAnalysis.fraud_score,\n    fraud_flags: fraudAnalysis.flags,\n    fraud_recomendacao: fraudAnalysis.recomendacao\n  }\n}];"
+      },
+      "id": "node-fn-fraud-parse",
+      "name": "16 - Function: Parsear Análise Fraude",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3320, 100]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.fraud_recomendacao }}",
+              "rightValue": "AUTO_APPROVE",
+              "operator": { "type": "string", "operation": "equals" }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.regras_ok }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-if-decisao",
+      "name": "17 - IF: Decisão Auto Aprovação",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3540, 100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.SLACK_BOT_TOKEN }}" },
+            { "name": "Content-Type",  "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"channel\": \"{{ $env.SLACK_CHANNEL_REVISAO }}\",\n  \"text\": \":mag: *Reembolso para revisão manual*\",\n  \"blocks\": [\n    {\n      \"type\": \"section\",\n      \"text\": {\n        \"type\": \"mrkdwn\",\n        \"text\": \"*request_id:* `{{ $json.request_id }}`\\n*Beneficiário:* {{ $json.parsed_data.beneficiario }}\\n*Procedimento:* {{ $json.parsed_data.procedimento }}\\n*Valor:* R$ {{ $json.valor_reembolso }}\\n*Fraud score:* {{ $json.fraud_score }}\\n*Flags:* {{ $json.fraud_flags }}\\n*Issues regras:* {{ $json.issues_regras }}\"\n      }\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "node-http-slack-revisao",
+      "name": "18 - HTTP: Slack Revisão Manual",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3760, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.stripe.com/v1/payouts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.STRIPE_SECRET_KEY }}" },
+            { "name": "Content-Type",  "value": "application/x-www-form-urlencoded" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "form-urlencoded",
+        "bodyParameters": {
+          "parameters": [
+            { "name": "amount",      "value": "={{ Math.round($json.valor_reembolso * 100) }}" },
+            { "name": "currency",    "value": "brl" },
+            { "name": "description", "value": "=Reembolso {{ $json.request_id }}" },
+            { "name": "metadata[request_id]", "value": "={{ $json.request_id }}" },
+            { "name": "metadata[user_id]",    "value": "={{ $json.user_id }}" }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-http-payment",
+      "name": "19 - HTTP: Pagamento (Stripe)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3760, 0]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE reembolso_requests\nSET \n  status = '{{ $json.payment_status }}',\n  valor_reembolso = {{ $json.valor_reembolso }},\n  fraud_score = {{ $json.fraud_score }},\n  fraud_flags = '{{ JSON.stringify($json.fraud_flags) }}'::jsonb,\n  regra_versao = '{{ $json.regra_versao }}',\n  payment_id = '{{ $json.payment_id ?? \"\" }}',\n  updated_at = NOW()\nWHERE request_id = '{{ $json.request_id }}'\nRETURNING *;",
+        "options": {}
+      },
+      "id": "node-pg-update-status",
+      "name": "20 - Postgres: Atualizar Status Final",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [3980, 100],
+      "credentials": {
+        "postgres": { "id": "CONFIGURE_PG_CRED", "name": "Postgres Supabase" }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\n\nconst notificacoes = [];\n\n// Email via SendGrid\nnotificacoes.push({\n  canal: 'email',\n  para: item.user_email ?? 'usuario@exemplo.com',\n  assunto: item.payment_status === 'APPROVED'\n    ? `Reembolso aprovado — R$ ${item.valor_reembolso}`\n    : 'Seu reembolso foi encaminhado para revisão',\n  corpo: `Olá, ${item.parsed_data.beneficiario}! \\nSeu pedido ${item.request_id} foi ${item.payment_status}.\\nValor: R$ ${item.valor_reembolso}\\nProcedimento: ${item.parsed_data.procedimento}`\n});\n\nreturn notificacoes.map(n => ({ json: { ...item, notificacao: n } }));"
+      },
+      "id": "node-fn-notificacao",
+      "name": "21 - Function: Preparar Notificações",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4200, 100]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.sendgrid.com/v3/mail/send",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.SENDGRID_API_KEY }}" },
+            { "name": "Content-Type",  "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"personalizations\": [{ \"to\": [{ \"email\": \"{{ $json.notificacao.para }}\" }] }],\n  \"from\": { \"email\": \"{{ $env.EMAIL_REMETENTE }}\" },\n  \"subject\": \"{{ $json.notificacao.assunto }}\",\n  \"content\": [{ \"type\": \"text/plain\", \"value\": \"{{ $json.notificacao.corpo }}\" }]\n}",
+        "options": {}
+      },
+      "id": "node-http-sendgrid",
+      "name": "22 - HTTP: Email (SendGrid)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4420, 100]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": true,\n  \"request_id\": \"{{ $json.request_id }}\",\n  \"status\": \"{{ $json.payment_status ?? 'MANUAL_REVIEW' }}\",\n  \"valor_reembolso\": {{ $json.valor_reembolso ?? 0 }}\n}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "node-response-ok",
+      "name": "23 - Response: Sucesso",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [4640, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"success\": false,\n  \"request_id\": \"{{ $json.request_id ?? 'N/A' }}\",\n  \"error\": \"INVALID_FILE\",\n  \"message\": \"Arquivo inválido. Envie PDF com até 10MB.\"\n}",
+        "options": { "responseCode": 422 }
+      },
+      "id": "node-response-invalid",
+      "name": "24 - Response: Arquivo Inválido",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO failed_jobs (request_id, user_id, etapa, erro, payload, created_at)\nVALUES (\n  '{{ $json.request_id ?? randomUUID() }}',\n  '{{ $json.user_id ?? \"unknown\" }}',\n  '{{ $execution.currentNodeName }}',\n  '{{ $json.error?.message ?? $json.message ?? \"erro desconhecido\" }}',\n  '{{ JSON.stringify($json) }}'::jsonb,\n  NOW()\n);",
+        "options": {}
+      },
+      "id": "node-pg-dlq",
+      "name": "25 - Postgres: Dead Letter Queue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [680, 400],
+      "credentials": {
+        "postgres": { "id": "CONFIGURE_PG_CRED", "name": "Postgres Supabase" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "=Bearer {{ $env.SLACK_BOT_TOKEN }}" },
+            { "name": "Content-Type",  "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\n  \"channel\": \"{{ $env.SLACK_CHANNEL_ALERTAS }}\",\n  \"text\": \":rotating_light: *ERRO CRÍTICO no fluxo de reembolsos*\\nrequest_id: `{{ $json.request_id ?? 'N/A' }}`\\nEtapa: `{{ $execution.currentNodeName }}`\\nErro: `{{ $json.error?.message ?? $json.message ?? 'desconhecido' }}`\"\n}",
+        "options": {}
+      },
+      "id": "node-http-slack-alert",
+      "name": "26 - HTTP: Slack Alerta Erro",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 400]
+    },
+    {
+      "parameters": {
+        "errorWorkflow": true
+      },
+      "id": "node-error-trigger",
+      "name": "00 - Error Trigger (DLQ entrada)",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [460, 400]
+    }
+  ],
+  "connections": {
+    "01 - Webhook Upload": {
+      "main": [[{ "node": "02 - Set: Normalizar Payload", "type": "main", "index": 0 }]]
+    },
+    "02 - Set: Normalizar Payload": {
+      "main": [[{ "node": "03 - Function: Gerar request_id", "type": "main", "index": 0 }]]
+    },
+    "03 - Function: Gerar request_id": {
+      "main": [[{ "node": "04 - IF: Arquivo Válido?", "type": "main", "index": 0 }]]
+    },
+    "04 - IF: Arquivo Válido?": {
+      "main": [
+        [
+          { "node": "05 - HTTP: Upload S3",           "type": "main", "index": 0 },
+          { "node": "06 - Postgres: Salvar Request",  "type": "main", "index": 0 }
+        ],
+        [{ "node": "24 - Response: Arquivo Inválido", "type": "main", "index": 0 }]
+      ]
+    },
+    "05 - HTTP: Upload S3": {
+      "main": [[{ "node": "07 - HTTP: OCR Google Vision", "type": "main", "index": 0 }]]
+    },
+    "06 - Postgres: Salvar Request": {
+      "main": [[{ "node": "07 - HTTP: OCR Google Vision", "type": "main", "index": 0 }]]
+    },
+    "07 - HTTP: OCR Google Vision": {
+      "main": [[{ "node": "08 - Function: Extrair Texto OCR", "type": "main", "index": 0 }]]
+    },
+    "08 - Function: Extrair Texto OCR": {
+      "main": [[{ "node": "09 - IF: OCR Confiança OK?", "type": "main", "index": 0 }]]
+    },
+    "09 - IF: OCR Confiança OK?": {
+      "main": [
+        [{ "node": "11 - HTTP: LLM Parsing (Claude)",      "type": "main", "index": 0 }],
+        [{ "node": "10 - HTTP: OCR Fallback (Textract)",   "type": "main", "index": 0 }]
+      ]
+    },
+    "10 - HTTP: OCR Fallback (Textract)": {
+      "main": [[{ "node": "11 - HTTP: LLM Parsing (Claude)", "type": "main", "index": 0 }]]
+    },
+    "11 - HTTP: LLM Parsing (Claude)": {
+      "main": [[{ "node": "12 - Function: Validar Schema", "type": "main", "index": 0 }]]
+    },
+    "12 - Function: Validar Schema": {
+      "main": [[{ "node": "13 - Postgres: Buscar Regras do Plano", "type": "main", "index": 0 }]]
+    },
+    "13 - Postgres: Buscar Regras do Plano": {
+      "main": [[{ "node": "14 - Function: Aplicar Regras ANS", "type": "main", "index": 0 }]]
+    },
+    "14 - Function: Aplicar Regras ANS": {
+      "main": [[{ "node": "15 - HTTP: Detecção de Fraude (LLM)", "type": "main", "index": 0 }]]
+    },
+    "15 - HTTP: Detecção de Fraude (LLM)": {
+      "main": [[{ "node": "16 - Function: Parsear Análise Fraude", "type": "main", "index": 0 }]]
+    },
+    "16 - Function: Parsear Análise Fraude": {
+      "main": [[{ "node": "17 - IF: Decisão Auto Aprovação", "type": "main", "index": 0 }]]
+    },
+    "17 - IF: Decisão Auto Aprovação": {
+      "main": [
+        [{ "node": "19 - HTTP: Pagamento (Stripe)",    "type": "main", "index": 0 }],
+        [{ "node": "18 - HTTP: Slack Revisão Manual",  "type": "main", "index": 0 }]
+      ]
+    },
+    "19 - HTTP: Pagamento (Stripe)": {
+      "main": [[{ "node": "20 - Postgres: Atualizar Status Final", "type": "main", "index": 0 }]]
+    },
+    "18 - HTTP: Slack Revisão Manual": {
+      "main": [[{ "node": "20 - Postgres: Atualizar Status Final", "type": "main", "index": 0 }]]
+    },
+    "20 - Postgres: Atualizar Status Final": {
+      "main": [[{ "node": "21 - Function: Preparar Notificações", "type": "main", "index": 0 }]]
+    },
+    "21 - Function: Preparar Notificações": {
+      "main": [[{ "node": "22 - HTTP: Email (SendGrid)", "type": "main", "index": 0 }]]
+    },
+    "22 - HTTP: Email (SendGrid)": {
+      "main": [[{ "node": "23 - Response: Sucesso", "type": "main", "index": 0 }]]
+    },
+    "00 - Error Trigger (DLQ entrada)": {
+      "main": [[
+        { "node": "25 - Postgres: Dead Letter Queue", "type": "main", "index": 0 },
+        { "node": "26 - HTTP: Slack Alerta Erro",     "type": "main", "index": 0 }
+      ]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "00 - Error Trigger (DLQ entrada)"
+  },
+  "staticData": null,
+  "tags": [
+    { "createdAt": "2026-04-06T00:00:00.000Z", "updatedAt": "2026-04-06T00:00:00.000Z", "id": "tag-reembolso", "name": "reembolso" },
+    { "createdAt": "2026-04-06T00:00:00.000Z", "updatedAt": "2026-04-06T00:00:00.000Z", "id": "tag-saude",     "name": "saude" }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2026-04-06T00:00:00.000Z",
+  "versionId": "v1.0.0",
+  "_meta": {
+    "instrucoes": {
+      "como_importar": "No n8n: Settings → Import Workflow → cole este JSON",
+      "variaveis_ambiente": [
+        "S3_BUCKET          — nome do bucket S3",
+        "AWS_REGION         — ex: us-east-1",
+        "ANTHROPIC_API_KEY  — chave da API do Claude",
+        "SLACK_BOT_TOKEN    — token do bot do Slack",
+        "SLACK_CHANNEL_REVISAO  — ID do canal de revisão manual",
+        "SLACK_CHANNEL_ALERTAS  — ID do canal de alertas de erro",
+        "STRIPE_SECRET_KEY  — chave secreta do Stripe",
+        "SENDGRID_API_KEY   — chave do SendGrid",
+        "EMAIL_REMETENTE    — ex: noreply@suaempresa.com.br"
+      ],
+      "credentials_para_configurar": [
+        "AWS Header Auth     — Authorization: AWS4-HMAC-SHA256 ...",
+        "Google Cloud API Key — x-goog-api-key: SUA_CHAVE",
+        "Postgres Supabase   — host, port, db, user, password",
+        "Todos os HTTP nodes que usam $env.* já estão mapeados"
+      ],
+      "schema_postgres": {
+        "tabelas": [
+          "reembolso_requests (request_id UUID PK, user_id, plano_id, file_url, status, valor_reembolso, fraud_score, fraud_flags JSONB, regra_versao, payment_id, received_at, updated_at)",
+          "failed_jobs        (id SERIAL PK, request_id, user_id, etapa, erro, payload JSONB, created_at)",
+          "planos             (id UUID PK, nome, ativo BOOLEAN)",
+          "plano_coberturas   (id UUID PK, plano_id FK, procedimento_codigo, procedimento_nome, cobertura_percentual, valor_maximo, carencia_dias, coparticipacao_percentual, versao)"
+        ]
+      }
+    }
+  }
+}
